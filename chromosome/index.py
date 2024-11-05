@@ -1,4 +1,5 @@
 import time
+import math
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -14,7 +15,6 @@ MU_G = 0.01
 MASS = 0.1  # kg
 
 
-MAGNET_RANGE = 2.0 / 100  # 2cm range
 MAGNET_CAPTURE_RANGE = 1.0 / 100  # 1cm capture range
 MAX_MAGNETIC_FORCE = 50  # N
 
@@ -35,7 +35,7 @@ class Chromosome:
         slope_positions = np.clip(base_positions + offsets, 0, SLOPE_LENGTH)
 
         # Create two sets of y coordinates for parallel positions
-        y_coords = np.array([-0.02 + 0.055, 0.02 + 0.055])
+        y_coords = np.array([-0.01 + 0.055, 0.01 + 0.055])
 
         # Using meshgrid to create all combinations of slope positions and y coordinates
         slope_grid, y_grid = np.meshgrid(slope_positions, y_coords)
@@ -69,53 +69,37 @@ class Chromosome:
 
         return real_coords
 
-    def magnetic_force(self, position, t):
+    def magnetic_force(self, position):
         # Convert position to slope coordinates
         x, y, z = position
 
-        # Calculate position along slope
-        slope_position = np.sqrt(x**2 + (SLOPE_HEIGHT - z) ** 2)
-
         total_force_parallel = 0
-        is_captured = False
-        capture_position = None
+        total_grip_effect = 0
 
         for magnet_pos in self.magnet_positions:
-            # Calculate distances
-            dx = x - magnet_pos[0]
-            dy = y - magnet_pos[1]
-            dz = z - magnet_pos[2]
+            # Only consider vertical (y) distance for magnetic effect
+            dy = abs(y - magnet_pos[1])  # Absolute vertical distance to magnet
 
-            # Total distance to magnet
-            distance = np.sqrt(dx**2 + dy**2 + dz**2)
+            # Check if ball is roughly above/below the magnet in x-z plane
+            dx = abs(x - magnet_pos[0])
 
-            # Calculate magnet's position along slope
-            magnet_slope_position = np.sqrt(
-                magnet_pos[0] ** 2 + (SLOPE_HEIGHT - magnet_pos[2]) ** 2
-            )
+            dy = round(dy, 2)
 
-            # Check if ball and magnet are at approximately same slope position
-            slope_difference = abs(slope_position - magnet_slope_position)
+            # Only apply magnetic force if ball is roughly above/below magnet
+            if dx <= 0.025 and dy <= MAGNET_CAPTURE_RANGE:
+                normalized_distance = dy / MAGNET_CAPTURE_RANGE
+                force_magnitude = MAX_MAGNETIC_FORCE * (
+                    1 / (1 + normalized_distance * 5)
+                )
+                total_grip_effect += force_magnitude / MAX_MAGNETIC_FORCE
 
-            if slope_difference < 0.025:
-                if distance < MAGNET_CAPTURE_RANGE:
-                    # Ball is captured
-                    is_captured = True
-                    capture_position = magnet_pos
-                    break
-                else:
-                    # Calculate force parallel to slope
-                    force_magnitude = MAX_MAGNETIC_FORCE * (
-                        1 - (distance / MAGNET_RANGE)
-                    )
+        # Normalize grip effect
+        total_grip_effect = min(total_grip_effect, 1.0)
 
-                    # Direction toward magnet along slope
-                    slope_direction = (
-                        -1 if slope_position > magnet_slope_position else 1
-                    )
-                    total_force_parallel += force_magnitude * slope_direction
+        # No direct parallel force - magnets only affect normal force
+        total_force_parallel = 0
 
-        return total_force_parallel, is_captured, capture_position
+        return total_force_parallel, total_grip_effect
 
     def calculate_slope_motion(self):
         positions = []
@@ -127,41 +111,61 @@ class Chromosome:
         t = 0
 
         while pos[2] > 0 and t < TOTAL_TIME:
+            # Store current state
             positions.append(pos.copy())
             velocities.append(vel.copy())
 
+            # Calculate parallel component of gravity
             g_parallel = G * np.sin(THETA)
 
             # Calculate magnetic force
-            mag_force, is_captured, capture_pos = self.magnetic_force(pos, t)
+            mag_force, grip_effect = self.magnetic_force(pos)
 
-            if is_captured:
-                # Ball is captured by magnet
-                pos = np.array(capture_pos)
-                vel = np.zeros(3)
-                t += self.dt
-                continue
+            # Normal force (perpendicular to slope)
+            N = MASS * G * np.cos(THETA) + mag_force * np.sin(THETA)
 
-            N = MASS * G * np.cos(THETA) + mag_force
+            base_friction = MU_R * N if N > 0 else 0
+            grip_friction = base_friction * (1 + grip_effect * 5)
 
-            # Rolling friction force
-            f_friction = MU_R * N
+            # Net acceleration (reduced by grip effect)
+            a_parallel = g_parallel + (mag_force / MASS)
+            a_parallel *= 1 - grip_effect * 0.5
 
-            # Net acceleration down the slope
-            a_net = g_parallel - (f_friction / MASS)
+            # Net acceleration parallel to slope
+            a_parallel -= grip_friction / MASS
 
+            # Convert parallel acceleration to x and z components
+            ax = a_parallel * np.cos(THETA)
+            az = -a_parallel * np.sin(THETA)
+
+            # Update velocity (reduced by grip effect)
+            vel_reduction = 1 - grip_effect * 0.3  # Velocity damping from grip
             vel_new = np.array(
                 [
-                    vel[0] + a_net * np.cos(THETA) * self.dt,
-                    0,
-                    vel[2] - a_net * np.sin(THETA) * self.dt,
+                    vel[0] + ax * self.dt,
+                    0,  # y-velocity remains 0
+                    vel[2] + az * self.dt,
                 ]
             )
 
-            pos_new = pos + vel * self.dt
+            # Calculate average velocity for position update
+            vel_avg = 0.5 * (vel + vel_new)
 
-            positions.append(pos)
-            velocities.append(vel)
+            # Update position
+            pos_new = pos + vel_avg * self.dt
+
+            # Check if we've reached the end of the slope
+            if pos_new[0] > SLOPE_LENGTH * np.cos(THETA):
+                # Linearly interpolate to find exact exit point
+                t_exit = (SLOPE_LENGTH * np.cos(THETA) - pos[0]) / (pos_new[0] - pos[0])
+                pos_new = pos + vel_avg * (self.dt * t_exit)
+                break
+
+            # Check if position is still on slope surface
+            expected_z = SLOPE_HEIGHT - pos_new[0] * np.tan(THETA)
+            if abs(pos_new[2] - expected_z) > 1e-6:
+                # Project back onto slope
+                pos_new[2] = expected_z
 
             pos = pos_new
             vel = vel_new
@@ -293,9 +297,9 @@ class Chromosome:
         for magnet_pos in self.magnet_positions:
             # Create a circle or sphere to show magnet range
             theta = np.linspace(0, 2 * np.pi, 20)
-            x = magnet_pos[0] + MAGNET_RANGE * np.cos(theta)
-            y = np.ones_like(theta) * magnet_pos[1]
-            z = magnet_pos[2] + MAGNET_RANGE * np.sin(theta)
+            x = magnet_pos[0] + MAGNET_CAPTURE_RANGE * np.cos(theta)
+            y = magnet_pos[1] + MAGNET_CAPTURE_RANGE * np.sin(theta)
+            z = np.ones_like(theta) * magnet_pos[2]
             ax.plot(x, y, z, "r--", alpha=0.3)  # Dashed line showing range
 
         # Plot slope
@@ -382,11 +386,12 @@ class Chromosome:
 
         # Print detailed results
         print("\nSimulation Results:")
-        # print(f"Time on slope: {self.t_slope:.3f} seconds")
-        # print(f"Time in air: {self.t_air:.3f} seconds")
-        # print(f"Total time: {TOTAL_TIME:.3f} seconds")
+        print(f"Time on slope: {self.t_slope:.3f} seconds")
+        print(f"Time in air: {self.t_air:.3f} seconds")
+        print(f"Total time: {TOTAL_TIME:.3f} seconds")
         print("\nFinal Position:")
         print(f"X (horizontal): {self.final_position[0]:.3f} m")
         print(f"Y (width): {self.final_position[1]:.3f} m")
         print(f"Z (height): {self.final_position[2]:.3f} m")
         print(f"\nTotal horizontal distance: {self.final_position[0]:.3f} m")
+        plt.close()
